@@ -7,6 +7,10 @@
 **Stack:** Go 1.22+ · Gin · Redis (rate limiting + JWKS cache)  
 **License:** Apache 2.0 · **Org:** [OpenKorProject](https://github.com/OpenKorProject)
 
+## Architecture
+
+![korapi architecture](docs/korapi_architecture.png)
+
 ## Quick start
 
 ```bash
