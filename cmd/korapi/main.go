@@ -17,42 +17,38 @@ import (
 )
 
 func main() {
-	// Config yükle
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// Redis client'ını oluştur
 	rdb := redis.NewClient(&redis.Options{
 		Addr: cfg.RedisAddr,
 	})
 	defer rdb.Close()
 
-	// Redis'e bağlan
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
 		log.Fatalf("Failed to connect to Redis: %v", err)
 	}
 
-	// Gin router oluştur
 	router := gin.Default()
 
-	// ===== MIDDLEWARE ZINCIRI =====
+	// ===== MIDDLEWARE CHAIN =====
 	// 1. Request ID
 	router.Use(middleware.RequestID())
 
 	// 2. Logging
 	router.Use(middleware.LoggingMiddleware())
 
-	// 3. CORS + Security headers
+	// 3. CORS + security headers
 	router.Use(middleware.CORS())
 	router.Use(middleware.SecurityHeaders())
 
-	// 4. Rate limit (tenant/IP başına)
+	// 4. Rate limiting (per tenant/IP)
 	rl := middleware.NewRateLimiter(rdb, cfg.RateLimitRPS)
 	router.Use(rl.Middleware())
 
-	// 5. JWT doğrulama (public paths hariç)
+	// 5. JWT validation (public paths bypass)
 	jwtValidator := middleware.NewJWTValidator(cfg.AuthURL)
 	publicPaths := []string{
 		"/v1/auth/login",
@@ -63,7 +59,7 @@ func main() {
 	}
 	router.Use(jwtValidator.Middleware(publicPaths))
 
-	// 6. RBAC context (JWT middleware içinde yapılıyor)
+	// 6. RBAC context injection (handled inside JWT middleware)
 
 	// 7. Audit log
 	auditLogger := audit.NewLogger()
@@ -71,24 +67,21 @@ func main() {
 
 	// 8. Reverse proxy
 
-	// ===== HANDLER'LAR =====
+	// ===== HANDLERS =====
 	h := handler.NewHandler()
 
-	// Health check endpoint'leri
 	router.GET("/healthz", h.Healthz)
 	router.GET("/readyz", h.Readyz)
 
-	// ===== REVERSE PROXY SETUP =====
+	// ===== REVERSE PROXY =====
 	p := proxy.NewProxy(&http.Client{
 		Timeout: 30 * time.Second,
 	})
 
-	// Upstream'ları kaydet
 	p.RegisterUpstream("auth", cfg.AuthURL)
 	p.RegisterUpstream("vm", cfg.VMUrl)
 	p.RegisterUpstream("vol", cfg.VolURL)
 
-	// Proxy route'ları
 	// Auth
 	router.GET("/v1/auth/*restOfPath", p.Handler("/v1/auth", "auth"))
 	router.POST("/v1/auth/*restOfPath", p.Handler("/v1/auth", "auth"))
@@ -110,10 +103,8 @@ func main() {
 	router.PATCH("/v1/vol/*restOfPath", p.Handler("/v1/vol", "vol"))
 	router.DELETE("/v1/vol/*restOfPath", p.Handler("/v1/vol", "vol"))
 
-	// 404 handler
 	router.NoRoute(h.NotFound)
 
-	// Server başlat
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	fmt.Printf("Gateway listening on %s\n", addr)
 	if err := router.Run(addr); err != nil {

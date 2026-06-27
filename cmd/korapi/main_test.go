@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/OpenKorProject/korapi/internal/config"
@@ -12,7 +12,6 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// TestHealthz healthz endpoint'i test et.
 func TestHealthz(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.Default()
@@ -31,13 +30,11 @@ func TestHealthz(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("Expected status 200, got %d", w.Code)
 	}
-
-	if !contains(w.Body.String(), "ok") {
+	if !strings.Contains(w.Body.String(), "ok") {
 		t.Errorf("Expected 'ok' in response, got %s", w.Body.String())
 	}
 }
 
-// TestReadyz readyz endpoint'i test et.
 func TestReadyz(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.Default()
@@ -56,13 +53,11 @@ func TestReadyz(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("Expected status 200, got %d", w.Code)
 	}
-
-	if !contains(w.Body.String(), "ready") {
+	if !strings.Contains(w.Body.String(), "ready") {
 		t.Errorf("Expected 'ready' in response, got %s", w.Body.String())
 	}
 }
 
-// TestNotFound 404 handler'ı test et.
 func TestNotFound(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.Default()
@@ -81,34 +76,23 @@ func TestNotFound(t *testing.T) {
 	if w.Code != http.StatusNotFound {
 		t.Errorf("Expected status 404, got %d", w.Code)
 	}
-
-	if !contains(w.Body.String(), "NOT_FOUND") {
+	if !strings.Contains(w.Body.String(), "NOT_FOUND") {
 		t.Errorf("Expected 'NOT_FOUND' in response, got %s", w.Body.String())
 	}
 }
 
-// TestConfigLoad config yükleme test et.
 func TestConfigLoad(t *testing.T) {
 	cfg, err := config.Load()
 	if err != nil {
 		t.Fatalf("Failed to load config: %v", err)
 	}
-
 	if cfg.Port == 0 {
 		t.Errorf("Port should not be 0")
 	}
-
 	if cfg.AuthURL == "" {
 		t.Errorf("AuthURL should not be empty")
 	}
-
 	if cfg.RedisAddr == "" {
 		t.Errorf("RedisAddr should not be empty")
 	}
-}
-
-// contains string'in içerip içermediğini kontrol et.
-func contains(haystack, needle string) bool {
-	return len(haystack) > 0 && len(needle) > 0 && (haystack == needle ||
-		fmt.Sprintf("%v", haystack) != "" && fmt.Sprintf("%v", needle) != "")
 }
