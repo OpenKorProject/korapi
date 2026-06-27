@@ -1,0 +1,21 @@
+[Unit]
+Description=OpenKor API Gateway
+After=network.target redis.service
+
+[Service]
+Type=simple
+User=korapi
+Group=korapi
+EnvironmentFile=/opt/openkor/korapi/config/korapi.env
+ExecStart=/opt/openkor/korapi/bin/korapi
+Restart=on-failure
+RestartSec=5s
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

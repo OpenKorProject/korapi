@@ -97,6 +97,39 @@ docker network create openkor
 # Add openkor network to each service's docker-compose.yaml
 ```
 
+### systemd
+
+The service unit file is kept in the repo at `systemd/korapi.service`.
+
+**1. Build the binary**
+
+```bash
+go build -o /opt/openkor/korapi/bin/korapi ./cmd/korapi
+```
+
+**2. Create the environment file**
+
+```bash
+sudo mkdir -p /opt/openkor/korapi/config
+sudo cp .env.example /opt/openkor/korapi/config/korapi.env
+# Edit /opt/openkor/korapi/config/korapi.env with production values
+```
+
+**3. Install the service unit**
+
+```bash
+sudo cp systemd/korapi.service /etc/systemd/system/korapi.service
+```
+
+**4. Enable and start**
+
+```bash
+sudo useradd --system --no-create-home korapi
+sudo systemctl daemon-reload
+sudo systemctl enable --now korapi
+sudo systemctl status korapi
+```
+
 ## API Contract
 
 See `api/openapi.yaml` — endpoints, error envelope, JWT claims, audit log format.
