@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  # Redis (rate limit + JWKS cache)
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - openkor
+
+  # korapi Gateway
+  korapi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      HTTP_PORT: "8080"
+      KORAPI_HOST: "0.0.0.0"
+      KORAUTH_URL: "http://korauth:8081"
+      KORVM_URL: "http://korvm:8082"
+      KORVOL_URL: "http://korvol:8083"
+      REDIS_URL: "redis://redis:6379/0"
+      LOG_LEVEL: "debug"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - openkor
+
+networks:
+  openkor:
+    external: true

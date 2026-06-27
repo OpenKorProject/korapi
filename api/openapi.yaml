@@ -1,0 +1,704 @@
+openapi: 3.0.3
+info:
+  title: OpenKor API Gateway
+  description: |
+    Single external entry point (gateway). All client traffic flows through here.
+    Responsibilities: reverse proxy, JWT auth, rate limiting, audit logging.
+  version: v1
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: http://localhost:8080
+    description: Development
+  - url: https://api.openkor.internal
+    description: Production
+
+# ===== CONTRACTS =====
+# Middleware Chain (order matters):
+# 1. Request ID (X-Request-ID header)
+# 2. Structured logging (start/end, duration, status)
+# 3. CORS + security headers
+# 4. Rate limiting (per tenant_id / IP, Redis sliding window)
+# 5. JWT validation (against korauth JWKS, cached)
+#    - Public paths: /v1/auth/login, /v1/auth/refresh, /v1/auth/.well-known/jwks.json
+#    - All others: Authorization: Bearer <JWT> required
+# 6. RBAC context injection (extract tenant_id, sub, roles from token; set downstream headers)
+# 7. Audit log (mutations: POST/PUT/PATCH/DELETE)
+# 8. Reverse proxy (forward to target service)
+#
+# Routing (declarative config):
+# /v1/auth/*   → korauth:8081
+# /v1/vm/*     → korvm:8082
+# /v1/vol/*    → korvol:8083
+# /healthz     → korapi itself
+# /readyz      → korapi itself
+
+tags:
+  - name: gateway
+    description: Gateway-own endpoints
+  - name: auth
+    description: Authentication (proxy to korauth)
+  - name: vm
+    description: VM management (proxy to korvm)
+  - name: vol
+    description: Volume management (proxy to korvol)
+
+paths:
+  /healthz:
+    get:
+      tags: [gateway]
+      summary: Liveness probe
+      operationId: healthz
+      x-openapi-router-skip-auth: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /readyz:
+    get:
+      tags: [gateway]
+      summary: Readiness probe
+      operationId: readyz
+      x-openapi-router-skip-auth: true
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ready
+        '503':
+          description: Service Unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  # ===== AUTH (korauth proxy) =====
+  /v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Login
+      operationId: postAuthLogin
+      x-openapi-router-skip-auth: true
+      x-rate-limit-per-second: 5
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username:
+                  type: string
+                password:
+                  type: string
+                tenant_id:
+                  type: string
+                  format: uuid
+              required: [username, password, tenant_id]
+      responses:
+        '200':
+          description: Login successful
+          headers:
+            X-Request-ID:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  access_token:
+                    type: string
+                  refresh_token:
+                    type: string
+                  token_type:
+                    type: string
+                  expires_in:
+                    type: integer
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '423':
+          description: Account locked due to too many failed attempts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      x-proxy-to: korauth:8081
+
+  /v1/auth/refresh:
+    post:
+      tags: [auth]
+      summary: Refresh access token
+      operationId: postAuthRefresh
+      x-openapi-router-skip-auth: true
+      x-rate-limit-per-second: 5
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refresh_token:
+                  type: string
+              required: [refresh_token]
+      responses:
+        '200':
+          description: Token refreshed
+          headers:
+            X-Request-ID:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  access_token:
+                    type: string
+                  refresh_token:
+                    type: string
+                  token_type:
+                    type: string
+                  expires_in:
+                    type: integer
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      x-proxy-to: korauth:8081
+
+  /v1/auth/.well-known/jwks.json:
+    get:
+      tags: [auth]
+      summary: JWT public key set (JWKS)
+      operationId: getAuthJwks
+      x-openapi-router-skip-auth: true
+      x-cache-ttl: 3600
+      responses:
+        '200':
+          description: JWKS
+          headers:
+            X-Request-ID:
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+                example: public, max-age=3600
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keys:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        kty:
+                          type: string
+                        kid:
+                          type: string
+                        use:
+                          type: string
+                        alg:
+                          type: string
+                        n:
+                          type: string
+                        e:
+                          type: string
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      x-proxy-to: korauth:8081
+
+  /v1/auth/{restOfPath}:
+    get:
+      tags: [auth]
+      summary: Auth — other GET requests (proxy)
+      operationId: getAuthProxy
+      parameters:
+        - name: restOfPath
+          in: path
+          required: true
+          schema:
+            type: string
+    post:
+      tags: [auth]
+      summary: Auth — other POST requests (proxy)
+      operationId: postAuthProxy
+      parameters:
+        - name: restOfPath
+          in: path
+          required: true
+          schema:
+            type: string
+    put:
+      tags: [auth]
+      summary: Auth — other PUT requests (proxy)
+      operationId: putAuthProxy
+      parameters:
+        - name: restOfPath
+          in: path
+          required: true
+          schema:
+            type: string
+    patch:
+      tags: [auth]
+      summary: Auth — other PATCH requests (proxy)
+      operationId: patchAuthProxy
+      parameters:
+        - name: restOfPath
+          in: path
+          required: true
+          schema:
+            type: string
+    delete:
+      tags: [auth]
+      summary: Auth — other DELETE requests (proxy)
+      operationId: deleteAuthProxy
+      parameters:
+        - name: restOfPath
+          in: path
+          required: true
+          schema:
+            type: string
+    responses:
+      '200':
+        description: Success
+        headers:
+          X-Request-ID:
+            schema:
+              type: string
+      '400':
+        $ref: '#/components/responses/BadRequest'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        $ref: '#/components/responses/Forbidden'
+      '404':
+        $ref: '#/components/responses/NotFound'
+      '409':
+        $ref: '#/components/responses/Conflict'
+      '422':
+        $ref: '#/components/responses/UnprocessableEntity'
+      '500':
+        $ref: '#/components/responses/InternalServerError'
+      '503':
+        $ref: '#/components/responses/ServiceUnavailable'
+    x-proxy-to: korauth:8081
+    x-audit-log: true
+
+  # ===== VM (korvm proxy) =====
+  /v1/vm/{restOfPath}:
+    get:
+      tags: [vm]
+      summary: VM — GET requests (proxy)
+      operationId: getVmProxy
+      parameters:
+        - name: restOfPath
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearerAuth: []
+    post:
+      tags: [vm]
+      summary: VM — POST requests (proxy)
+      operationId: postVmProxy
+      parameters:
+        - name: restOfPath
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearerAuth: []
+    put:
+      tags: [vm]
+      summary: VM — PUT requests (proxy)
+      operationId: putVmProxy
+      parameters:
+        - name: restOfPath
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearerAuth: []
+    patch:
+      tags: [vm]
+      summary: VM — PATCH requests (proxy)
+      operationId: patchVmProxy
+      parameters:
+        - name: restOfPath
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearerAuth: []
+    delete:
+      tags: [vm]
+      summary: VM — DELETE requests (proxy)
+      operationId: deleteVmProxy
+      parameters:
+        - name: restOfPath
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearerAuth: []
+    responses:
+      '200':
+        description: Success
+        headers:
+          X-Request-ID:
+            schema:
+              type: string
+      '201':
+        description: Created
+        headers:
+          X-Request-ID:
+            schema:
+              type: string
+      '202':
+        description: Accepted (async job)
+        headers:
+          X-Request-ID:
+            schema:
+              type: string
+      '400':
+        $ref: '#/components/responses/BadRequest'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        $ref: '#/components/responses/Forbidden'
+      '404':
+        $ref: '#/components/responses/NotFound'
+      '409':
+        $ref: '#/components/responses/Conflict'
+      '422':
+        $ref: '#/components/responses/UnprocessableEntity'
+      '500':
+        $ref: '#/components/responses/InternalServerError'
+      '503':
+        $ref: '#/components/responses/ServiceUnavailable'
+    x-proxy-to: korvm:8082
+    x-audit-log: true
+
+  # ===== VOL (korvol proxy) =====
+  /v1/vol/{restOfPath}:
+    get:
+      tags: [vol]
+      summary: Vol — GET requests (proxy)
+      operationId: getVolProxy
+      parameters:
+        - name: restOfPath
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearerAuth: []
+    post:
+      tags: [vol]
+      summary: Vol — POST requests (proxy)
+      operationId: postVolProxy
+      parameters:
+        - name: restOfPath
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearerAuth: []
+    put:
+      tags: [vol]
+      summary: Vol — PUT requests (proxy)
+      operationId: putVolProxy
+      parameters:
+        - name: restOfPath
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearerAuth: []
+    patch:
+      tags: [vol]
+      summary: Vol — PATCH requests (proxy)
+      operationId: patchVolProxy
+      parameters:
+        - name: restOfPath
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearerAuth: []
+    delete:
+      tags: [vol]
+      summary: Vol — DELETE requests (proxy)
+      operationId: deleteVolProxy
+      parameters:
+        - name: restOfPath
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearerAuth: []
+    responses:
+      '200':
+        description: Success
+        headers:
+          X-Request-ID:
+            schema:
+              type: string
+      '201':
+        description: Created
+        headers:
+          X-Request-ID:
+            schema:
+              type: string
+      '202':
+        description: Accepted (async job)
+        headers:
+          X-Request-ID:
+            schema:
+              type: string
+      '400':
+        $ref: '#/components/responses/BadRequest'
+      '401':
+        $ref: '#/components/responses/Unauthorized'
+      '403':
+        $ref: '#/components/responses/Forbidden'
+      '404':
+        $ref: '#/components/responses/NotFound'
+      '409':
+        $ref: '#/components/responses/Conflict'
+      '422':
+        $ref: '#/components/responses/UnprocessableEntity'
+      '500':
+        $ref: '#/components/responses/InternalServerError'
+      '503':
+        $ref: '#/components/responses/ServiceUnavailable'
+    x-proxy-to: korvol:8083
+    x-audit-log: true
+
+components:
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, request_id]
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code (SCREAMING_SNAKE_CASE)
+              example: VM_NOT_FOUND
+            message:
+              type: string
+              description: Human-readable error message
+              example: Virtual machine not found
+            details:
+              type: object
+              description: Additional error details (optional)
+              nullable: true
+              example: { "id": "abc123" }
+            request_id:
+              type: string
+              description: Request ID (matches audit log entry)
+              example: req-2026-06-26-001
+
+    JWTClaims:
+      type: object
+      description: Required claims in a JWT token
+      required: [sub, tenant_id, roles, iat, exp, iss]
+      properties:
+        sub:
+          type: string
+          format: uuid
+          description: User UUID
+        tenant_id:
+          type: string
+          format: uuid
+          description: Tenant UUID
+        roles:
+          type: array
+          items:
+            type: string
+            enum: [admin, operator, viewer]
+          description: User roles
+        iat:
+          type: integer
+          description: Token issued-at time (Unix timestamp)
+        exp:
+          type: integer
+          description: Token expiry time (Unix timestamp, default 15 min)
+        iss:
+          type: string
+          enum: [openkor-auth]
+          description: Token issuer
+        kid:
+          type: string
+          description: Key ID (supports key rotation)
+
+    AuditLogEntry:
+      type: object
+      description: Audit log entry (for mutation requests)
+      required: [request_id, tenant_id, user_id, method, path, status, timestamp]
+      properties:
+        request_id:
+          type: string
+        tenant_id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        method:
+          type: string
+          enum: [POST, PUT, PATCH, DELETE]
+        path:
+          type: string
+          example: /v1/vm/
+        target:
+          type: string
+          description: Target resource (optional), e.g. vm:uuid
+          nullable: true
+        status:
+          type: integer
+          example: 201
+        timestamp:
+          type: string
+          format: date-time
+
+  responses:
+    BadRequest:
+      description: Bad Request (400)
+      headers:
+        X-Request-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    Unauthorized:
+      description: Unauthorized (401) — missing or invalid token
+      headers:
+        X-Request-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    Forbidden:
+      description: Forbidden (403) — insufficient permissions
+      headers:
+        X-Request-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    NotFound:
+      description: Not Found (404)
+      headers:
+        X-Request-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    Conflict:
+      description: Conflict (409) — state conflict
+      headers:
+        X-Request-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    UnprocessableEntity:
+      description: Unprocessable Entity (422) — invalid input
+      headers:
+        X-Request-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    InternalServerError:
+      description: Internal Server Error (500)
+      headers:
+        X-Request-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    ServiceUnavailable:
+      description: Service Unavailable (503) — downstream service unreachable
+      headers:
+        X-Request-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT token (RS256), issued by korauth.
+        Required claims: sub, tenant_id, roles, iat, exp, iss=openkor-auth, kid.
+
+security:
+  - bearerAuth: []
